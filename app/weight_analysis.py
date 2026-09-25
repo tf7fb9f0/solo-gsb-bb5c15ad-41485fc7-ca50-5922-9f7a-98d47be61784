@@ -7,19 +7,22 @@
     总分_c(w) = 该项目最终均分_c × w + (最终总分_c − 该项目最终均分_c)
     缺失该项目的选手：斜率为 0（按 0 贡献），截距即其最终总分。
 
-枚举两两选手直线在闭区间 [0, 上限] 内的交点（临界倍率），合并同位置交点；
-平行（含始终并列的重合直线）不产生交点。对每个临界点给出该倍率下的竞赛
-名次、总分与交点处并列的选手，并在相邻临界点（含端点 0、上限）构成的开
-区间中点给出名次快照。
+枚举两两选手直线在闭区间 [0, 上限] 内的交点（临界倍率），合并同位置交点。
+斜率与截距按浮点计算结果**精确比较**：斜率完全相等才视为平行，斜率与截距
+都完全相等（两线确实重合）才视为始终并列——不使用随分数尺度放大的相对
+容差，否则大数总分下真实的斜率差会被判成平行、不同的截距会被判成始终
+并列，可表示且落在区间内的真实交点就被漏报。对每个临界点给出该倍率下
+的竞赛名次、总分与交点处并列的选手，并在相邻临界点（含端点 0、上限）
+构成的开区间中点给出名次快照。
 
 整个计算只读，不触碰评分、裁决或会话；评分、裁决或校准范围变化后由调用
 方重新计算。
 """
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
-from .scoring import SCOPE_LABELS, TIE_EPS, competition_rank
+from .scoring import SCOPE_LABELS, competition_rank
 
 WEIGHT_LOWER = 0.0
 WEIGHT_UPPER_MIN = 1.0
@@ -29,16 +32,10 @@ WEIGHT_UPPER_MAX = 5.0
 _ROOT_TOL_REL = 1e-10
 # 同位置交点的合并容差（w 尺度最大为 5，绝对容差足够吸收浮点误差）。
 _CLUSTER_TOL = 1e-9
-# 两斜率视为相等（平行）的相对容差。
-_SLOPE_REL_EPS = 1e-12
 
 
 class WeightValidationError(ValueError):
     """请求参数不合法（项目不存在、倍率上限越界等）。"""
-
-
-def _max_abs(values: Sequence[float]) -> float:
-    return max([1.0] + [abs(v) for v in values])
 
 
 class _DSU:
@@ -115,21 +112,21 @@ def weight_threshold_analysis(
         intercept[name] = float(b["eff_total"]) - d
         has_item[name] = ib is not None
 
-    slope_scale = _max_abs(list(slope.values()))
-    total_scale = _max_abs(
-        [intercept[n] + slope[n] * w for n in names for w in (WEIGHT_LOWER, upper_bound)]
-    )
     root_tol = _ROOT_TOL_REL * max(1.0, upper_bound)
 
+    # 平行判定对斜率的浮点计算结果精确比较：完全相等才算平行。若按随分数
+    # 尺度放大的相对容差判定，大数总分下真实的斜率差（如 1e12 与 1e12+0.5）
+    # 会被容差吞没，可表示且落在区间内的真实交点就被漏报。
     def parallel(i: str, j: str) -> bool:
-        return abs(slope[i] - slope[j]) <= _SLOPE_REL_EPS * slope_scale
+        return slope[i] == slope[j]
 
-    # 始终并列（直线重合）：斜率相同且截距相同——这些选手在任何倍率下都并列，
-    # 按需求不产生交点，仅在汇总中提示。
+    # 始终并列（直线确实重合）：斜率与截距的浮点计算结果都完全相等——这些
+    # 选手在任何倍率下都并列，按需求不产生交点，仅在汇总中提示。截距不同
+    # 的平行线永不相交，即使截距差相对总分尺度很小也不得误判为始终并列。
     always_dsu = _DSU()
     for x, i in enumerate(names):
         for j in names[x + 1:]:
-            if parallel(i, j) and abs(intercept[i] - intercept[j]) <= TIE_EPS * total_scale:
+            if parallel(i, j) and intercept[i] == intercept[j]:
                 always_dsu.union(i, j)
     always_tied = sorted(
         (g for g in always_dsu.groups() if len(g) >= 2),

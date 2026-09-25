@@ -35,6 +35,14 @@ def run(rows=BASE, item="I2", upper=3.0, decisions=None, scope="judge"):
     )
 
 
+def run_raw(rows, item="I2", upper=2.0, scope="judge"):
+    # 全部评分裁决为「保留原分」，最终均分/总分即原始分本身，
+    # 大数场景下可精确手算斜率、截距与交点。
+    records = make_records(rows)
+    decisions = {rec["id"]: (True, "精确手算") for rec in records}
+    return weight_threshold_analysis(analyze(records, decisions, scope), item, upper)
+
+
 def kinds(entries):
     return [e["kind"] for e in entries]
 
@@ -222,6 +230,127 @@ class TestWeightThreshold(unittest.TestCase):
         r = run(upper=1.0)
         self.assertEqual(r["upper_bound"], 1.0)
         self.assertTrue(all(0.0 <= e["w"] <= 1.0 for e in r["entries"]))
+
+
+class TestWeightThresholdNumerics(unittest.TestCase):
+    """交点/并列判定的数值稳健性：可表示的真实差异不得被随尺度放大的容差吞没。"""
+
+    BIG = 1e12
+
+    @staticmethod
+    def rank_at(entry, name):
+        return next(x["rank"] for x in entry["ranking"] if x["contestant"] == name)
+
+    def test_large_scale_crossing_listed_with_rank_swap(self):
+        # 大数反例回归：甲 总分(w)=1e12·w+0.5，乙 总分(w)=(1e12+0.5)·w，
+        # 两线在 w=1 真实相交并交换领先，不得判为平行或始终并列。
+        rows = [
+            ("C1", "J", "I1", 0.5), ("C2", "J", "I1", 0.0),
+            ("C1", "J", "I2", self.BIG), ("C2", "J", "I2", self.BIG + 0.5),
+        ]
+        r = run_raw(rows, upper=2.0)
+        self.assertEqual(r["always_tied_groups"], [])
+        self.assertEqual(r["summary"]["crossing_pairs"], 1)
+        self.assertEqual(r["summary"]["critical_points"], 1)
+        self.assertEqual(kinds(r["entries"]), ["midpoint", "critical", "midpoint"])
+        crit = next(e for e in r["entries"] if e["kind"] == "critical")
+        self.assertAlmostEqual(crit["w"], 1.0, places=12)
+        self.assertIsNone(crit["boundary"])
+        self.assertEqual(crit["ties"], [["C1", "C2"]])
+        # 交点处两人总分相等（1e12+0.5）、并列第一。
+        self.assertEqual({row["rank"] for row in crit["ranking"]}, {1})
+        for row in crit["ranking"]:
+            self.assertAlmostEqual(row["total"], self.BIG + 0.5, places=3)
+        # 交点前后名次正确：w=0.5 时 C1 领先，w=1.5 时 C2 领先。
+        mids = [e for e in r["entries"] if e["kind"] == "midpoint"]
+        self.assertAlmostEqual(mids[0]["w"], 0.5, places=12)
+        self.assertAlmostEqual(mids[1]["w"], 1.5, places=12)
+        self.assertLess(self.rank_at(mids[0], "C1"), self.rank_at(mids[0], "C2"))
+        self.assertLess(self.rank_at(mids[1], "C2"), self.rank_at(mids[1], "C1"))
+
+    def test_large_scale_distinct_intercepts_not_always_tied(self):
+        # 大数总分下截距不同的平行线（斜率同为 1e12，截距 0.5 vs 0）永不相交，
+        # 不得因截距差相对总分尺度很小而误判为始终并列。
+        rows = [
+            ("C1", "J", "I1", 0.5), ("C2", "J", "I1", 0.0),
+            ("C1", "J", "I2", self.BIG), ("C2", "J", "I2", self.BIG),
+        ]
+        r = run_raw(rows, upper=2.0)
+        self.assertEqual(r["always_tied_groups"], [])
+        self.assertEqual(critical_ws(r), [])
+        self.assertEqual(r["summary"]["crossing_pairs"], 0)
+        # 任意倍率下 C1 都恰好领先 0.5，名次不得并列。
+        mid = next(e for e in r["entries"] if e["kind"] == "midpoint")
+        totals = {row["contestant"]: row["total"] for row in mid["ranking"]}
+        self.assertAlmostEqual(totals["C1"] - totals["C2"], 0.5, places=9)
+        self.assertLess(self.rank_at(mid, "C1"), self.rank_at(mid, "C2"))
+
+    def test_large_scale_truly_coincident_always_tied(self):
+        # 只有两条总分线确实重合（斜率与截距完全相同）才标为始终并列。
+        rows = [
+            ("C1", "J", "I1", 0.5), ("C2", "J", "I1", 0.5),
+            ("C1", "J", "I2", self.BIG), ("C2", "J", "I2", self.BIG),
+        ]
+        r = run_raw(rows, upper=2.0)
+        self.assertEqual(r["always_tied_groups"], [["C1", "C2"]])
+        self.assertEqual(critical_ws(r), [])
+        self.assertEqual(r["summary"]["crossing_pairs"], 0)
+        mid = next(e for e in r["entries"] if e["kind"] == "midpoint")
+        self.assertEqual({row["rank"] for row in mid["ranking"]}, {1})
+
+    def test_normal_scale_tiny_slope_difference(self):
+        # 普通尺度回归：斜率差 2**-40 是可表示的真实差异，同样不得吞没——
+        # C1: 10w+1；C2: (10+2^-40)·w+(1-2^-40) → 恰在 w=1 相交并交换总分先后。
+        d = 2.0 ** -40
+        rows = [
+            ("C1", "J", "I1", 1.0), ("C2", "J", "I1", 1.0 - d),
+            ("C1", "J", "I2", 10.0), ("C2", "J", "I2", 10.0 + d),
+        ]
+        r = run_raw(rows, upper=2.0)
+        self.assertEqual(r["always_tied_groups"], [])
+        crit = [e for e in r["entries"] if e["kind"] == "critical"]
+        self.assertEqual(len(crit), 1)
+        self.assertAlmostEqual(crit[0]["w"], 1.0, places=12)
+        self.assertEqual(crit[0]["ties"], [["C1", "C2"]])
+        # 交点前后总分方向交换（差值 4.5e-13 在排名同分容差内，名次仍并列）。
+        mids = [e for e in r["entries"] if e["kind"] == "midpoint"]
+        totals = [
+            {row["contestant"]: row["total"] for row in e["ranking"]} for e in mids
+        ]
+        self.assertGreater(totals[0]["C1"], totals[0]["C2"])
+        self.assertGreater(totals[1]["C2"], totals[1]["C1"])
+
+    def test_large_scale_crossing_at_upper_boundary(self):
+        # 端点交点回归（大数尺度）：C1: 1e12·w+0.5；C2: (1e12+0.25)·w
+        # → 恰在 w=2（上限）相交，标记 boundary="end"。
+        rows = [
+            ("C1", "J", "I1", 0.5), ("C2", "J", "I1", 0.0),
+            ("C1", "J", "I2", self.BIG), ("C2", "J", "I2", self.BIG + 0.25),
+        ]
+        r = run_raw(rows, upper=2.0)
+        self.assertEqual(r["always_tied_groups"], [])
+        crit = [e for e in r["entries"] if e["kind"] == "critical"]
+        self.assertEqual(len(crit), 1)
+        self.assertAlmostEqual(crit[0]["w"], 2.0, places=12)
+        self.assertEqual(crit[0]["boundary"], "end")
+        self.assertEqual(crit[0]["ties"], [["C1", "C2"]])
+        self.assertEqual(kinds(r["entries"]), ["midpoint", "critical"])
+
+    def test_large_scale_crossing_at_lower_boundary(self):
+        # 端点交点回归（大数尺度）：截距相同（0.5）、斜率不同 → 恰在 w=0 相交；
+        # 共享截距不等于两线重合，不得判为始终并列。
+        rows = [
+            ("C1", "J", "I1", 0.5), ("C2", "J", "I1", 0.5),
+            ("C1", "J", "I2", self.BIG), ("C2", "J", "I2", self.BIG + 0.5),
+        ]
+        r = run_raw(rows, upper=2.0)
+        self.assertEqual(r["always_tied_groups"], [])
+        crit = [e for e in r["entries"] if e["kind"] == "critical"]
+        self.assertEqual(len(crit), 1)
+        self.assertAlmostEqual(crit[0]["w"], 0.0, places=12)
+        self.assertEqual(crit[0]["boundary"], "start")
+        self.assertEqual(crit[0]["ties"], [["C1", "C2"]])
+        self.assertEqual(kinds(r["entries"]), ["critical", "midpoint"])
 
 
 if __name__ == "__main__":
