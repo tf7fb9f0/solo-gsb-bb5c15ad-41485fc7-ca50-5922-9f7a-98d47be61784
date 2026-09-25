@@ -35,6 +35,14 @@ def run(rows=BASE, item="I2", upper=3.0, decisions=None, scope="judge"):
     )
 
 
+def run_raw(rows, item="I2", upper=3.0, scope="judge"):
+    # 全部评分裁决为「保留原分」，使最终均分/总分精确等于原始分，
+    # 大数尺度下的斜率与截距不受校准往返的浮点噪声影响。
+    recs = make_records(rows)
+    decisions = {rec["id"]: (True, "钉住原分") for rec in recs}
+    return weight_threshold_analysis(analyze(recs, decisions, scope), item, upper)
+
+
 def kinds(entries):
     return [e["kind"] for e in entries]
 
@@ -222,6 +230,97 @@ class TestWeightThreshold(unittest.TestCase):
         r = run(upper=1.0)
         self.assertEqual(r["upper_bound"], 1.0)
         self.assertTrue(all(0.0 <= e["w"] <= 1.0 for e in r["entries"]))
+
+    def test_large_scale_crossing_not_swallowed(self):
+        # 大数反例：甲目标项目均分 1e12、其他项目合计 0.5；
+        # 乙分别为 1e12+0.5 与 0。总分线 1e12·w+0.5 与 (1e12+0.5)·w
+        # 在 w=1 相交并交换领先——斜率差 0.5、截距差 0.5 都是可表示的
+        # 真实差异，不得被全体分数尺度的相对容差判成平行/始终并列。
+        rows = [
+            ("甲", "J", "I1", 0.5), ("乙", "J", "I1", 0.0),
+            ("甲", "J", "I2", 1e12), ("乙", "J", "I2", 1e12 + 0.5),
+        ]
+        r = run_raw(rows, upper=2.0)
+        self.assertEqual(r["always_tied_groups"], [])  # 不重合，不得标始终并列
+        self.assertEqual(r["summary"]["crossing_pairs"], 1)
+        self.assertEqual(kinds(r["entries"]), ["midpoint", "critical", "midpoint"])
+        crit = next(e for e in r["entries"] if e["kind"] == "critical")
+        self.assertAlmostEqual(crit["w"], 1.0, places=12)
+        self.assertIsNone(crit["boundary"])
+        self.assertEqual([set(g) for g in crit["ties"]], [{"甲", "乙"}])
+        # 交点处两人总分恰好相等（1e12+0.5），竞赛名次并列第 1。
+        self.assertEqual({row["rank"] for row in crit["ranking"]}, {1})
+        for row in crit["ranking"]:
+            self.assertAlmostEqual(row["total"], 1e12 + 0.5, places=3)
+        # 交点前后名次正确交换：w=0.5 甲领先，w=1.5 乙领先。
+        mids = [e for e in r["entries"] if e["kind"] == "midpoint"]
+        self.assertAlmostEqual(mids[0]["w"], 0.5, places=12)
+        self.assertAlmostEqual(mids[1]["w"], 1.5, places=12)
+        rank_at = lambda e, n: next(x["rank"] for x in e["ranking"] if x["contestant"] == n)
+        self.assertLess(rank_at(mids[0], "甲"), rank_at(mids[0], "乙"))
+        self.assertLess(rank_at(mids[1], "乙"), rank_at(mids[1], "甲"))
+
+    def test_huge_third_party_keeps_normal_scale_crossing(self):
+        # 普通尺度回归：C3 斜率 1e12 把全体斜率尺度抬高，但 C1/C2 之间
+        # 0.5 的斜率差是真实差异，w=0.5 的交点不得被判平行吞掉。
+        rows = BASE + [("C3", "J", "I1", 1e12), ("C3", "J", "I2", 1e12)]
+        r = run_raw(rows, upper=3.0)
+        self.assertEqual(r["always_tied_groups"], [])
+        # C3 的直线 1e12·w+1e12 全程在上方，不与 C1/C2 在区间内相交。
+        self.assertEqual(r["summary"]["crossing_pairs"], 1)
+        crit = [e for e in r["entries"] if e["kind"] == "critical"]
+        self.assertEqual(len(crit), 1)
+        self.assertAlmostEqual(crit[0]["w"], 0.5, places=9)
+        self.assertEqual(crit[0]["ties"], [["C1", "C2"]])
+        # C3 在每个快照中都稳居第 1。
+        for e in r["entries"]:
+            top = min(e["ranking"], key=lambda x: x["rank"])
+            self.assertEqual(top["contestant"], "C3")
+
+    def test_large_scale_crossing_at_upper_endpoint(self):
+        # 大数尺度的端点交点：两线恰在 w=上限 处相交（2e12+1）。
+        rows = [
+            ("C1", "J", "I1", 1.0), ("C2", "J", "I1", 0.0),
+            ("C1", "J", "I2", 1e12), ("C2", "J", "I2", 1e12 + 0.5),
+        ]
+        r = run_raw(rows, upper=2.0)
+        self.assertEqual(r["always_tied_groups"], [])
+        crit = [e for e in r["entries"] if e["kind"] == "critical"]
+        self.assertEqual(len(crit), 1)
+        self.assertAlmostEqual(crit[0]["w"], 2.0, places=12)
+        self.assertEqual(crit[0]["boundary"], "end")
+        self.assertEqual(kinds(r["entries"]), ["midpoint", "critical"])
+        # 区间内部 C1 始终领先（截距高 1），端点处被追平。
+        mid = next(e for e in r["entries"] if e["kind"] == "midpoint")
+        rank_at = lambda n: next(x["rank"] for x in mid["ranking"] if x["contestant"] == n)
+        self.assertLess(rank_at("C1"), rank_at("C2"))
+        self.assertEqual({row["rank"] for row in crit[0]["ranking"]}, {1})
+
+    def test_large_scale_coincident_lines_still_always_tied(self):
+        # 大数尺度下斜率与截距都相同（直线确实重合）才标始终并列。
+        rows = [
+            ("C1", "J", "I1", 0.5), ("C2", "J", "I1", 0.5),
+            ("C1", "J", "I2", 1e12), ("C2", "J", "I2", 1e12),
+        ]
+        r = run_raw(rows, upper=2.0)
+        self.assertEqual(r["always_tied_groups"], [["C1", "C2"]])
+        self.assertEqual(critical_ws(r), [])
+        self.assertEqual(r["summary"]["crossing_pairs"], 0)
+
+    def test_large_scale_parallel_offset_lines_not_always_tied(self):
+        # 大数尺度：斜率相同（1e12）但截距差 0.5 → 平行不重合，
+        # 既无交点也不得标始终并列；C1 全程领先 0.5。
+        rows = [
+            ("C1", "J", "I1", 1.0), ("C2", "J", "I1", 0.5),
+            ("C1", "J", "I2", 1e12), ("C2", "J", "I2", 1e12),
+        ]
+        r = run_raw(rows, upper=2.0)
+        self.assertEqual(r["always_tied_groups"], [])
+        self.assertEqual(critical_ws(r), [])
+        self.assertEqual(r["summary"]["crossing_pairs"], 0)
+        mid = next(e for e in r["entries"] if e["kind"] == "midpoint")
+        rank_at = lambda n: next(x["rank"] for x in mid["ranking"] if x["contestant"] == n)
+        self.assertLess(rank_at("C1"), rank_at("C2"))
 
 
 if __name__ == "__main__":

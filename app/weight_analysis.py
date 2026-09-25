@@ -17,9 +17,10 @@
 """
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+import math
+from typing import Any, Mapping
 
-from .scoring import SCOPE_LABELS, TIE_EPS, competition_rank
+from .scoring import SCOPE_LABELS, competition_rank
 
 WEIGHT_LOWER = 0.0
 WEIGHT_UPPER_MIN = 1.0
@@ -29,16 +30,26 @@ WEIGHT_UPPER_MAX = 5.0
 _ROOT_TOL_REL = 1e-10
 # 同位置交点的合并容差（w 尺度最大为 5，绝对容差足够吸收浮点误差）。
 _CLUSTER_TOL = 1e-9
-# 两斜率视为相等（平行）的相对容差。
-_SLOPE_REL_EPS = 1e-12
+# 斜率/截距「相等」的判定容差：两者自身量级的 ulp 倍数。
+# 校准、求均值、求和只引入个位数 ulp 量级的误差，64 ulp 足以吸收；
+# 绝不能改用全体分数尺度的相对容差——大数总分下真实存在的差异
+# （如斜率 1e12 与 1e12+0.5）必须保持可区分，否则真实交点会被误判为
+# 平行、不同截距会被误判为始终并列。
+_EQ_ULPS = 64
 
 
 class WeightValidationError(ValueError):
     """请求参数不合法（项目不存在、倍率上限越界等）。"""
 
 
-def _max_abs(values: Sequence[float]) -> float:
-    return max([1.0] + [abs(v) for v in values])
+def _float_eq(a: float, b: float) -> bool:
+    """a 与 b 是否在浮点表示精度（若干 ulp）内相等。
+
+    容差只随被比较的两个值自身的量级缩放，与全体分数尺度无关。
+    """
+    if a == b:
+        return True
+    return abs(a - b) <= _EQ_ULPS * math.ulp(max(abs(a), abs(b)))
 
 
 class _DSU:
@@ -115,21 +126,18 @@ def weight_threshold_analysis(
         intercept[name] = float(b["eff_total"]) - d
         has_item[name] = ib is not None
 
-    slope_scale = _max_abs(list(slope.values()))
-    total_scale = _max_abs(
-        [intercept[n] + slope[n] * w for n in names for w in (WEIGHT_LOWER, upper_bound)]
-    )
     root_tol = _ROOT_TOL_REL * max(1.0, upper_bound)
 
     def parallel(i: str, j: str) -> bool:
-        return abs(slope[i] - slope[j]) <= _SLOPE_REL_EPS * slope_scale
+        return _float_eq(slope[i], slope[j])
 
     # 始终并列（直线重合）：斜率相同且截距相同——这些选手在任何倍率下都并列，
-    # 按需求不产生交点，仅在汇总中提示。
+    # 按需求不产生交点，仅在汇总中提示。两个判定都用表示精度级容差，
+    # 大数总分下不同的截距不会被吞并成「始终并列」。
     always_dsu = _DSU()
     for x, i in enumerate(names):
         for j in names[x + 1:]:
-            if parallel(i, j) and abs(intercept[i] - intercept[j]) <= TIE_EPS * total_scale:
+            if parallel(i, j) and _float_eq(intercept[i], intercept[j]):
                 always_dsu.union(i, j)
     always_tied = sorted(
         (g for g in always_dsu.groups() if len(g) >= 2),
